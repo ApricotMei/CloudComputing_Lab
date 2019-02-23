@@ -1,0 +1,291 @@
+from operator import attrgetter
+
+from ryu.app import simple_switch_13
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER, DEAD_DISPATCHER
+from ryu.controller.handler import set_ev_cls
+from ryu.lib import hub
+from ryu.base import app_manager
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from ryu.ofproto import ofproto_v1_3
+from ryu.ofproto import ether
+from ryu.ofproto import inet
+from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import arp
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import tcp
+from ryu.lib.packet import udp
+
+
+class SimpleMonitor13(app_manager.RyuApp):
+
+    def __init__(self, *args, **kwargs):
+        super(SimpleMonitor13, self).__init__(*args, **kwargs)
+        self.datapaths = {}
+        self.monitor_thread = hub.spawn(self._monitor)
+        self.s3_2 = 0
+        self.s3_2_old = 0
+        self.s3_2_new = 0
+        self.s3_3 = 0
+        self.s3_3_old = 0
+        self.s3_3_new = 0
+        self.s4_2 = 0
+        self.s4_2_old = 0
+        self.s4_2_new = 0
+        self.s4_3 = 0
+        self.s4_3_old = 0
+        self.s4_3_new = 0
+        self.s5_2 = 0
+        self.s5_2_old = 0
+        self.s5_2_new = 0
+        self.s5_3 = 0
+        self.s5_3_old = 0
+        self.s5_3_new = 0
+        self.arp_table={}
+        self.arp_table["10.0.0.1"]="00:00:00:00:00:01"
+        self.arp_table["10.0.0.2"]="00:00:00:00:00:02"
+        self.arp_table["10.0.0.3"]="00:00:00:00:00:03"
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # Insert Static rule
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(datapath, 0, match, actions)
+
+        # Installing static rules to process TCP/UDP and ICMP and ACL
+        dpid = datapath.id  # classifying the switch ID
+
+        if dpid == 1: # switch S1
+            #implement TCP fwding
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.1', 10, 1)  #to h1
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.2', 10, 2)  #to h2                 
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.3', 10, 3)  #to h3
+    
+        elif dpid == 3: # switch S2
+            #implement TCP fwding
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.1', 10, 1)  #to h1
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.2', 10, 2)  #to h2
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.3', 10, 2)  #to h3
+
+        elif dpid == 4: # switch S3
+            #implement TCP fwding
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.1', 10, 2)  #to h1
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.2', 10, 1)  #to h2            
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.3', 10, 2)  #to h3
+
+        elif dpid == 5: # switch S4
+
+            ### implement tcp fwding
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.1', 10, 2)  #h1
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.2', 10, 2)  #h2         
+            self.add_layer4_rules(datapath, inet.IPPROTO_UDP, '10.0.0.3', 10, 1)  #h3    
+
+    @set_ev_cls(ofp_event.EventOFPStateChange,
+                [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def _state_change_handler(self, ev):
+        datapath = ev.datapath
+        if ev.state == MAIN_DISPATCHER:
+            if datapath.id not in self.datapaths:
+                self.logger.debug('register datapath: %016x', datapath.id)
+                self.datapaths[datapath.id] = datapath
+        elif ev.state == DEAD_DISPATCHER:
+            if datapath.id in self.datapaths:
+                self.logger.debug('unregister datapath: %016x', datapath.id)
+                del self.datapaths[datapath.id]
+
+    def _monitor(self):
+        while True:
+            for dp in self.datapaths.values():
+                self._request_stats(dp)
+            hub.sleep(10)
+
+    def _request_stats(self, datapath):
+        self.logger.debug('send stats request: %016x', datapath.id)
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        req = parser.OFPFlowStatsRequest(datapath)
+        datapath.send_msg(req)
+
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        datapath.send_msg(req)
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        body = ev.msg.body
+
+        self.logger.info('datapath         '
+                         'in-port  eth-dst           '
+                         'out-port packets  bytes')
+        self.logger.info('---------------- '
+                         '-------- ----------------- '
+                         '-------- -------- --------')
+        for stat in sorted([flow for flow in body if flow.priority == 1],
+                           key=lambda flow: (flow.match['in_port'],
+                                             flow.match['eth_dst'])):
+            self.logger.info('%016x %8x %17s %8x %8d %8d',
+                             ev.msg.datapath.id,
+                             stat.match['in_port'], stat.match['eth_dst'],
+                             stat.instructions[0].actions[0].port,
+                             stat.packet_count, stat.byte_count)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        body = ev.msg.body
+
+        self.logger.info('datapath         port     '
+                         'rx-pkts  rx-bytes rx-error '
+                         'tx-pkts  tx-bytes tx-error')
+        self.logger.info('---------------- -------- '
+                         '-------- -------- -------- '
+                         '-------- -------- --------')
+        s3s1rx = open("s3s1rx.txt", "a")
+        s3s1tx = open("s3s1tx.txt", "a")
+        s4s1rx = open("s4s1rx.txt", "a")
+        s4s1tx = open("s4s1tx.txt", "a")
+        s5s1rx = open("s5s1rx.txt", "a")
+        s5s1tx = open("s5s1tx.txt", "a")
+        s3s2rx = open("s3s2rx.txt", "a")
+        s3s2tx = open("s3s2tx.txt", "a")
+        s4s2rx = open("s4s2rx.txt", "a")
+        s4s2tx = open("s4s2tx.txt", "a")
+        s5s2rx = open("s5s2rx.txt", "a")
+        s5s2tx = open("s5s2tx.txt", "a")
+        for stat in sorted(body, key=attrgetter('port_no')):
+            self.logger.info('%016x %8x %8d %8d %8d %8d %8d %8d',
+                             ev.msg.datapath.id, stat.port_no,
+                             stat.rx_packets, stat.rx_bytes, stat.rx_errors,
+                             stat.tx_packets, stat.tx_bytes, stat.tx_errors)
+            self.logger.info('reply port')
+            if ev.msg.datapath.id == 3 and stat.port_no == 2:
+                str1 = str(stat.rx_bytes)
+                s3s1rx.write(str1+'\n')
+                str2 = str(stat.tx_bytes)
+                s3s1tx.write(str2+'\n')
+                #for each switch, saving the old record, 
+                #and add received bytes and transmitted bytes to the new one
+                #let the difference between these two variant to be the determining factor
+                self.s3_2_old = self.s3_2_new
+                self.s3_2_new = stat.rx_bytes + stat.tx_bytes
+                self.s3_2 = self.s3_2_new - self.s3_2_old
+            if ev.msg.datapath.id == 4 and stat.port_no == 2:
+                str3 = str(stat.rx_bytes)
+                s4s1rx.write(str3+'\n')
+                str4 = str(stat.tx_bytes)
+                s4s1tx.write(str4+'\n')
+                self.s4_2_old = self.s4_2_new
+                self.s4_2_new = stat.rx_bytes + stat.tx_bytes
+                self.s4_2 = self.s4_2_new - self.s4_2_old
+            if ev.msg.datapath.id == 5 and stat.port_no == 2:
+                str5 = str(stat.rx_bytes)
+                s5s1rx.write(str5+'\n')
+                str6 = str(stat.tx_bytes)
+                s5s1tx.write(str6+'\n')
+                self.s5_2_old = self.s5_2_new
+                self.s5_2_new = stat.rx_bytes + stat.tx_bytes
+                self.s5_2 = self.s5_2_new - self.s5_2_old
+            if ev.msg.datapath.id == 3 and stat.port_no == 3:
+                str7 = str(stat.rx_bytes)
+                s3s2rx.write(str7+'\n')
+                str8 = str(stat.tx_bytes)
+                s3s2tx.write(str8+'\n')
+                self.s3_3_old = self.s3_3_new
+                self.s3_3_new = stat.rx_bytes + stat.tx_bytes
+                self.s3_3 = self.s3_3_new - self.s3_3_old
+            if ev.msg.datapath.id == 4 and stat.port_no == 3:
+                str9 = str(stat.rx_bytes)
+                s4s2rx.write(str9+'\n')
+                str10 = str(stat.tx_bytes)
+                s4s2tx.write(str10+'\n')
+                self.s4_3_old = self.s4_3_new
+                self.s4_3_new = stat.rx_bytes + stat.tx_bytes
+                self.s4_3 = self.s4_3_new - self.s4_3_old
+            if ev.msg.datapath.id == 5 and stat.port_no == 3:
+                str11 = str(stat.rx_bytes)
+                s5s2rx.write(str11+'\n')
+                str12 = str(stat.tx_bytes)
+                s5s2tx.write(str12+'\n')
+                self.s5_3_old = self.s5_3_new
+                self.s5_3_new = stat.rx_bytes + stat.tx_bytes
+                self.s5_3 = self.s5_3_new - self.s5_3_old
+
+        s3s1rx.close()
+        s3s1tx.close()
+        s4s1rx.close()
+        s4s1tx.close()
+        s5s1rx.close()
+        s5s1tx.close()
+        s3s2rx.close()
+        s3s2tx.close()
+        s4s2rx.close()
+        s4s2tx.close()
+        s5s2rx.close()
+        s5s2tx.close()
+
+
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        in_port = msg.match['in_port']
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+        ethertype = eth.ethertype
+
+        # process ARP
+        if ethertype == ether.ETH_TYPE_ARP:
+            self.handle_arp(datapath, in_port, pkt)
+            return
+
+        # process IP
+        
+
+
+
+    # Member methods you can call to install TCP/UDP/ICMP fwding rules
+    def add_layer4_rules(self, datapath, ip_proto, ipv4_dst = None, priority = 1, fwd_port = None):
+        parser = datapath.ofproto_parser
+        actions = [parser.OFPActionOutput(fwd_port)]
+        match = parser.OFPMatch(eth_type = ether.ETH_TYPE_IP,ip_proto = ip_proto,ipv4_dst = ipv4_dst)
+        self.add_flow(datapath, priority, match, actions)
+
+    # Member methods you can call to install general rules
+    def add_flow(self, datapath, priority, match, actions):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,actions)]
+
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,match=match, instructions=inst)
+        datapath.send_msg(mod)
+
+    def handle_arp(self, datapath, in_port, pkt):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # parse out the ethernet and arp packet
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        arp_pkt = pkt.get_protocol(arp.arp)
+        # obtain the MAC of dst IP
+        arp_resolv_mac = self.arp_table[arp_pkt.dst_ip]
+
+        ether_hd = ethernet.ethernet(dst = eth_pkt.src,src = arp_resolv_mac,ethertype = ether.ETH_TYPE_ARP);
+        arp_hd = arp.arp(hwtype=1, proto=0x0800, hlen=6, plen=4, opcode=2,src_mac=arp_resolv_mac, src_ip=arp_pkt.dst_ip,dst_mac=arp_pkt.src_mac, dst_ip=arp_pkt.src_ip)
+        arp_reply = packet.Packet();
+        arp_reply.add_protocol(ether_hd)
+        arp_reply.add_protocol(arp_hd)
+        arp_reply.serialize()
+        # send the Packet Out mst to back to the host who is initilaizing the ARP
+        actions = [parser.OFPActionOutput(in_port)];
+        out = parser.OFPPacketOut(datapath, ofproto.OFP_NO_BUFFER,ofproto.OFPP_CONTROLLER, actions,arp_reply.data)
+        datapath.send_msg(out)
